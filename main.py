@@ -24,7 +24,7 @@ def set_seed(seed=42):
 
 def download(dataset_id='D4RL/pen/expert-v2'):
     dataset = minari.load_dataset(dataset_id, True)
-    observations, actions, rewards, terminations, truncations, next_observations, steps = [], [], [], [], [], [], []
+    observations, actions, rewards, terminations, truncations, next_observations, next_actions, next_steps, steps = [], [], [], [], [], [], [], [], []
     for episode in dataset.iterate_episodes():
         episode_length = len(episode.observations)
         for i in range(min(100, episode_length - 1)):
@@ -34,7 +34,10 @@ def download(dataset_id='D4RL/pen/expert-v2'):
             terminations.append(episode.terminations[i])
             truncations.append(episode.truncations[i])
             next_obs = episode.observations[i + 1]
+            next_act = episode.actions[i + 1] if i + 1 < episode_length else np.zeros_like(episode.actions[i])
             next_observations.append(next_obs)
+            next_actions.append(next_act)
+            next_steps.append(i + 2)
             steps.append(i + 1)  # Number of step for each transition
 
     return dataset, {
@@ -44,6 +47,8 @@ def download(dataset_id='D4RL/pen/expert-v2'):
         'terminations': np.array(terminations),
         'truncations': np.array(truncations),
         'next_observations': np.array(next_observations),
+        'next_actions': np.array(next_actions),
+        'next_steps': np.array(next_steps),
         'dones': np.logical_or(terminations, truncations).astype(int),
         'steps': np.array(steps)  # New key for step count for each transition
     }
@@ -135,20 +140,24 @@ def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Actor, self).__init__()
-        self.network = nn.Sequential(
+        # Shared base layers for mean and log_std
+        self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim)
+            nn.ReLU()
         )
-        self.log_std = nn.Parameter(torch.zeros(action_dim))  # Learnable log standard deviation
+        # Separate heads for mean and log_std
+        self.mean_layer = nn.Linear(128, action_dim)
+        self.log_std_layer = nn.Linear(128, action_dim)
 
     def forward(self, state):
-        mean = self.network(state)
-        std = F.softplus(self.log_std)  # Correctly apply Softplus activation
+        shared_output = self.shared_layers(state)
+        mean = torch.tanh(self.mean_layer(shared_output))  # Squash mean to [-1, 1]
+        log_std = self.log_std_layer(shared_output)  # Unbounded log_std
+        std = torch.exp(log_std.clamp(min=-20, max=2))  # Clamp log_std to avoid extreme values
         return mean, std
 
 
@@ -185,7 +194,7 @@ def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
             mean, std = actor(state_tensor)
             dist = Normal(mean, std)
-            action = dist.mean.cpu().numpy()[0]
+            action = dist.mean.detach().cpu().numpy()[0]
             state, reward, terminated, truncated, _ = env.step(action)
             episode_reward += reward
 
@@ -200,11 +209,10 @@ def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
             video_folder=video_folder,
             fps=env.metadata.get("render_fps", 30),
             step_starting_index=0,
-            episode_index=episode_index
+            episode_index=episode_index,
         )
     
     avg_reward = np.mean(total_rewards)
-    print(f"Saved evaluation videos in '{video_folder}'")
     return avg_reward
 
 
@@ -213,8 +221,11 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
     actions = torch.tensor(dataset['actions'], dtype=torch.float32)
     rewards = torch.tensor(dataset['rewards'], dtype=torch.float32).unsqueeze(-1)
     steps = torch.tensor(dataset['steps'], dtype=torch.float32).unsqueeze(-1)
+    next_observations = torch.tensor(dataset['next_observations'], dtype=torch.float32)
+    next_actions = torch.tensor(dataset['next_actions'], dtype=torch.float32)
+    next_steps = torch.tensor(dataset['next_steps'], dtype=torch.float32).unsqueeze(-1)
 
-    full_dataset = TensorDataset(observations, actions, rewards, steps)
+    full_dataset = TensorDataset(observations, actions, rewards, steps, next_observations, next_actions, next_steps)
     train_size = int(len(full_dataset) * 0.8)
     test_size = len(full_dataset) - train_size
     train_dataset, _ = random_split(full_dataset, [train_size, test_size])
@@ -239,13 +250,19 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
         actor.train()
         critic.train()
         epoch_actor_loss, epoch_critic_loss = 0, 0
-        for batch_states, batch_actions, batch_rewards, batch_steps in data_loader:
+        for batch_states, batch_actions, batch_rewards, batch_steps, batch_next_states, batch_next_actions, batch_next_steps in data_loader:
             # Predict steps using the pre-trained StepPredictionModel
             step_predicted = step_model(batch_states)
 
-            # Compute values
+            # Compute next state and next action values for critic
+            with torch.no_grad():
+                next_step_predicted = step_model(batch_next_states)
+                next_values = critic(batch_next_states, batch_next_actions, next_step_predicted)
+
+            # Compute values for current state
             predicted_values = critic(batch_states, batch_actions, step_predicted)
-            advantages = batch_rewards - predicted_values.detach()
+            target_values = batch_rewards + gamma * next_values
+            advantages = target_values - predicted_values.detach()
 
             # Update Actor
             mean, std = actor(batch_states)
@@ -260,7 +277,6 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
             actor_optimizer.step()
 
             # Update Critic
-            target_values = batch_rewards + gamma * predicted_values.detach()
             critic_loss = mse_loss(predicted_values, target_values)
 
             critic_optimizer.zero_grad()
@@ -289,7 +305,8 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
 
 # Example usage:
 if __name__ == "__main__":
+    env_name = 'D4RL/door/expert-v2'
     set_seed()
-    dataset = download()[1]
-    step_model = train_step_prediction_model(dataset, epochs=100)
-    actor, critic = actor_critic_training(dataset, step_model, env_name='D4RL/pen/expert-v2', epochs=30)
+    dataset = download(env_name)[1]
+    step_model = train_step_prediction_model(dataset, epochs=20)
+    actor, critic = actor_critic_training(dataset, step_model, env_name=env_name, epochs=100)
