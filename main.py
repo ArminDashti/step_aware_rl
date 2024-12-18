@@ -8,10 +8,8 @@ from torch.distributions import Normal
 import gymnasium as gym
 from gymnasium.utils.save_video import save_video
 import random
-import torch.nn.functional as F  # Import functional API for activation functions
 import os
 from datetime import datetime
-
 
 def set_seed(seed=42):
     np.random.seed(seed)
@@ -20,7 +18,6 @@ def set_seed(seed=42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def download(dataset_id='D4RL/pen/expert-v2'):
     dataset = minari.load_dataset(dataset_id, True)
@@ -38,7 +35,7 @@ def download(dataset_id='D4RL/pen/expert-v2'):
             next_observations.append(next_obs)
             next_actions.append(next_act)
             next_steps.append(i + 2)
-            steps.append(i + 1)  # Number of step for each transition
+            steps.append(i + 1)
 
     return dataset, {
         'observations': np.array(observations),
@@ -50,9 +47,8 @@ def download(dataset_id='D4RL/pen/expert-v2'):
         'next_actions': np.array(next_actions),
         'next_steps': np.array(next_steps),
         'dones': np.logical_or(terminations, truncations).astype(int),
-        'steps': np.array(steps)  # New key for step count for each transition
+        'steps': np.array(steps)
     }
-
 
 class StepPredictionModel(nn.Module):
     def __init__(self, state_dim):
@@ -70,7 +66,6 @@ class StepPredictionModel(nn.Module):
     def forward(self, state):
         return self.network(state)
 
-
 def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
     save_path = "c:/users/armin/step_aware/"
     model_filename = os.path.join(save_path, "step_aware.pth")
@@ -80,7 +75,6 @@ def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
     state_dim = dataset['observations'].shape[1]
     model = StepPredictionModel(state_dim)
 
-    # Check if pre-trained model exists
     if os.path.exists(model_filename):
         print("Pre-trained model found. Loading model...")
         model.load_state_dict(torch.load(model_filename))
@@ -88,7 +82,6 @@ def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
         print("Model loaded. Skipping training.")
         return model
 
-    # Training process
     observations = torch.tensor(dataset['observations'], dtype=torch.float32)
     steps = torch.tensor(dataset['steps'], dtype=torch.float32).unsqueeze(-1)
 
@@ -118,10 +111,8 @@ def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
         avg_epoch_loss = epoch_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs}, Training Loss: {avg_epoch_loss:.4f}")
 
-        # Save model checkpoint for the epoch
         torch.save(model.state_dict(), model_filename)
         
-        # Append epoch information to log file
         with open(log_file, "a") as log:
             log.write(f"Epoch {epoch+1}, Training Loss: {avg_epoch_loss:.4f}, Model: step_aware.pth\n")
 
@@ -136,11 +127,9 @@ def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
     print(f"Test Loss: {test_loss / len(test_loader):.4f}")
     return model
 
-
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Actor, self).__init__()
-        # Shared base layers for mean and log_std
         self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, 256),
             nn.LayerNorm(256),
@@ -149,17 +138,15 @@ class Actor(nn.Module):
             nn.LayerNorm(128),
             nn.ReLU()
         )
-        # Separate heads for mean and log_std
         self.mean_layer = nn.Linear(128, action_dim)
         self.log_std_layer = nn.Linear(128, action_dim)
 
     def forward(self, state):
         shared_output = self.shared_layers(state)
-        mean = torch.tanh(self.mean_layer(shared_output))  # Squash mean to [-1, 1]
-        log_std = self.log_std_layer(shared_output)  # Unbounded log_std
-        std = torch.exp(log_std.clamp(min=-20, max=2))  # Clamp log_std to avoid extreme values
+        mean = torch.tanh(self.mean_layer(shared_output))
+        log_std = self.log_std_layer(shared_output)
+        std = torch.exp(log_std.clamp(min=-20, max=2))
         return mean, std
-
 
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -174,10 +161,9 @@ class Critic(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, state, action, step_predicted):
-        x = torch.cat([state, action, step_predicted], dim=1)
+    def forward(self, state, action, next_steps):
+        x = torch.cat([state, action, next_steps], dim=1)
         return self.network(x)
-
 
 def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
     total_rewards = []
@@ -198,12 +184,10 @@ def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
             state, reward, terminated, truncated, _ = env.step(action)
             episode_reward += reward
 
-            # Render the current frame and add it to the list
             frames.append(env.render())
 
         total_rewards.append(episode_reward)
 
-        # Save video for the episode
         save_video(
             frames=frames,
             video_folder=video_folder,
@@ -214,7 +198,6 @@ def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
     
     avg_reward = np.mean(total_rewards)
     return avg_reward
-
 
 def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, batch_size=256, env_name="D4RL/pen/expert-v2"):
     observations = torch.tensor(dataset['observations'], dtype=torch.float32)
@@ -251,20 +234,20 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
         critic.train()
         epoch_actor_loss, epoch_critic_loss = 0, 0
         for batch_states, batch_actions, batch_rewards, batch_steps, batch_next_states, batch_next_actions, batch_next_steps in data_loader:
-            # Predict steps using the pre-trained StepPredictionModel
             step_predicted = step_model(batch_states)
-
-            # Compute next state and next action values for critic
+            predicted_values = critic(batch_states, batch_actions, step_predicted)
             with torch.no_grad():
                 next_step_predicted = step_model(batch_next_states)
-                next_values = critic(batch_next_states, batch_next_actions, next_step_predicted)
+                next_values = critic(batch_next_states, batch_next_actions, batch_next_steps)
 
-            # Compute values for current state
-            predicted_values = critic(batch_states, batch_actions, step_predicted)
             target_values = batch_rewards + gamma * next_values
             advantages = target_values - predicted_values.detach()
 
-            # Update Actor
+            critic_loss = mse_loss(predicted_values, target_values)
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            critic_optimizer.step()
+
             mean, std = actor(batch_states)
             dist = Normal(mean, std)
             action_sample = dist.rsample()
@@ -276,37 +259,24 @@ def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, b
             actor_loss.backward()
             actor_optimizer.step()
 
-            # Update Critic
-            critic_loss = mse_loss(predicted_values, target_values)
-
-            critic_optimizer.zero_grad()
-            critic_loss.backward()
-            critic_optimizer.step()
-
             epoch_actor_loss += actor_loss.item()
             epoch_critic_loss += critic_loss.item()
 
-        # Evaluate Policy and save video
         avg_reward = evaluate_policy(env, actor)
         print(f"Epoch {epoch+1}/{epochs}, Actor Loss: {epoch_actor_loss/len(data_loader):.4f}, "
               f"Critic Loss: {epoch_critic_loss/len(data_loader):.4f}, Avg Reward: {avg_reward:.2f}")
         
-        # Append epoch information to log file
         with open(log_file, "a") as log:
             log.write(f"Epoch {epoch+1}, Actor Loss: {epoch_actor_loss/len(data_loader):.4f}, "
                       f"Critic Loss: {epoch_critic_loss/len(data_loader):.4f}, Avg Reward: {avg_reward:.2f}\n")
         
-        # Save model checkpoints for each epoch
         torch.save(actor.state_dict(), os.path.join(save_path, f"actor.pth"))
         torch.save(critic.state_dict(), os.path.join(save_path, f"critic.pth"))
 
-    return actor, critic
 
-
-# Example usage:
 if __name__ == "__main__":
     env_name = 'D4RL/door/expert-v2'
     set_seed()
     dataset = download(env_name)[1]
-    step_model = train_step_prediction_model(dataset, epochs=20)
-    actor, critic = actor_critic_training(dataset, step_model, env_name=env_name, epochs=100)
+    step_model = train_step_prediction_model(dataset, epochs=1)
+    actor_critic_training(dataset, step_model, env_name=env_name, epochs=100)
