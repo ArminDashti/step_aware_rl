@@ -1,17 +1,33 @@
-import minari
+import os
+import random
+from datetime import datetime
+import argparse
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset
 from torch.distributions import Normal
 import gymnasium as gym
-from gymnasium.utils.save_video import save_video
-import random
-import os
-from datetime import datetime
+from gymnasium.wrappers import RecordVideo
+import minari
 
-def set_seed(seed=42):
+
+# Constants
+DEFAULT_SEED = 42
+DEFAULT_EPOCHS = 20
+DEFAULT_LR = 1e-4
+DEFAULT_GAMMA = 0.99
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_ENV_NAME = "D4RL/door/expert-v2"
+SAVE_PATH_WINDOWS = "C:/users/armin/step_aware"
+SAVE_PATH_UNIX = "/home/armin/step_aware"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed: int) -> None:
+    """Set random seed for reproducibility."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -19,116 +35,60 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def download(dataset_id='D4RL/pen/expert-v2'):
-    dataset = minari.load_dataset(dataset_id, True)
-    observations, actions, rewards, terminations, truncations, next_observations, next_actions, next_steps, steps = [], [], [], [], [], [], [], [], []
+
+def normalize_rewards(rewards: np.ndarray) -> np.ndarray:
+    """Normalize rewards to have zero mean and unit variance."""
+    return (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+
+def preprocess_dataset(dataset) -> dict:
+    """Preprocess the Minari dataset into a structured format."""
+    keys = [
+        'observations', 'actions', 'rewards', 'terminations', 'truncations',
+        'next_observations', 'prev_observations', 'prev_actions',
+        'prev_rewards', 'prev_dones'
+    ]
+    data = {key: [] for key in keys}
+
     for episode in dataset.iterate_episodes():
         episode_length = len(episode.observations)
-        for i in range(min(100, episode_length - 1)):
-            observations.append(episode.observations[i])
-            actions.append(episode.actions[i])
-            rewards.append(episode.rewards[i])
-            terminations.append(episode.terminations[i])
-            truncations.append(episode.truncations[i])
-            next_obs = episode.observations[i + 1]
-            next_act = episode.actions[i + 1] if i + 1 < episode_length else np.zeros_like(episode.actions[i])
-            next_observations.append(next_obs)
-            next_actions.append(next_act)
-            next_steps.append(i + 2)
-            steps.append(i + 1)
+        for i in range(min(100, episode_length)):
+            data['observations'].append(episode.observations[i])
+            data['actions'].append(episode.actions[i])
+            data['rewards'].append(episode.rewards[i])
+            data['terminations'].append(episode.terminations[i])
+            data['truncations'].append(episode.truncations[i])
+            data['next_observations'].append(
+                episode.observations[i + 1] if i + 1 < episode_length else np.zeros_like(episode.observations[i])
+            )
+            data['prev_observations'].append(
+                episode.observations[i - 1] if i > 0 else np.zeros_like(episode.observations[i])
+            )
+            data['prev_actions'].append(
+                episode.actions[i - 1] if i > 0 else np.zeros_like(episode.actions[i])
+            )
+            data['prev_rewards'].append(episode.rewards[i - 1] if i > 0 else 0.0)
+            data['prev_dones'].append(
+                1 if i > 0 and (episode.terminations[i - 1] or episode.truncations[i - 1]) else 0
+            )
 
-    return dataset, {
-        'observations': np.array(observations),
-        'actions': np.array(actions),
-        'rewards': np.array(rewards),
-        'terminations': np.array(terminations),
-        'truncations': np.array(truncations),
-        'next_observations': np.array(next_observations),
-        'next_actions': np.array(next_actions),
-        'next_steps': np.array(next_steps),
-        'dones': np.logical_or(terminations, truncations).astype(int),
-        'steps': np.array(steps)
-    }
+    data['rewards'] = normalize_rewards(np.array(data['rewards']))
+    data['prev_rewards'] = normalize_rewards(np.array(data['prev_rewards']))
+    data['dones'] = np.logical_or(data['terminations'], data['truncations']).astype(int)
 
-class StepPredictionModel(nn.Module):
-    def __init__(self, state_dim):
-        super(StepPredictionModel, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
+    return {key: np.array(value) for key, value in data.items()}
 
-    def forward(self, state):
-        return self.network(state)
 
-def train_step_prediction_model(dataset, epochs=20, lr=1e-3, batch_size=128):
-    save_path = "c:/users/armin/step_aware/"
-    model_filename = os.path.join(save_path, "step_aware.pth")
-    log_file = os.path.join(save_path, "step_aware_log.txt")
-    os.makedirs(save_path, exist_ok=True)
+def download_dataset(dataset_id: str) -> tuple:
+    """Download and preprocess the Minari dataset."""
+    dataset = minari.load_dataset(dataset_id, True)
+    return dataset, preprocess_dataset(dataset)
 
-    state_dim = dataset['observations'].shape[1]
-    model = StepPredictionModel(state_dim)
-
-    if os.path.exists(model_filename):
-        print("Pre-trained model found. Loading model...")
-        model.load_state_dict(torch.load(model_filename))
-        model.eval()
-        print("Model loaded. Skipping training.")
-        return model
-
-    observations = torch.tensor(dataset['observations'], dtype=torch.float32)
-    steps = torch.tensor(dataset['steps'], dtype=torch.float32).unsqueeze(-1)
-
-    full_dataset = TensorDataset(observations, steps)
-    train_size = int(len(full_dataset) * 0.8)
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0
-
-        for batch_states, batch_steps in train_loader:
-            optimizer.zero_grad()
-            predicted_steps = model(batch_states)
-            loss = loss_fn(predicted_steps, batch_steps)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Training Loss: {avg_epoch_loss:.4f}")
-
-        torch.save(model.state_dict(), model_filename)
-        
-        with open(log_file, "a") as log:
-            log.write(f"Epoch {epoch+1}, Training Loss: {avg_epoch_loss:.4f}, Model: step_aware.pth\n")
-
-    model.eval()
-    test_loss = 0
-    with torch.no_grad():
-        for batch_states, batch_steps in test_loader:
-            predicted_steps = model(batch_states)
-            loss = loss_fn(predicted_steps, batch_steps)
-            test_loss += loss.item()
-
-    print(f"Test Loss: {test_loss / len(test_loader):.4f}")
-    return model
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    """Actor network for policy representation."""
+
+    def __init__(self, state_dim: int, action_dim: int):
         super(Actor, self).__init__()
         self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, 256),
@@ -141,18 +101,26 @@ class Actor(nn.Module):
         self.mean_layer = nn.Linear(128, action_dim)
         self.log_std_layer = nn.Linear(128, action_dim)
 
-    def forward(self, state):
+    def forward(self, state: torch.Tensor) -> Normal:
         shared_output = self.shared_layers(state)
         mean = torch.tanh(self.mean_layer(shared_output))
-        log_std = self.log_std_layer(shared_output)
-        std = torch.exp(log_std.clamp(min=-20, max=2))
-        return mean, std
+        log_std = self.log_std_layer(shared_output).clamp(min=-20, max=2)
+        return Normal(mean, torch.exp(log_std))
+
+    def sample_action(self, state: torch.Tensor) -> tuple:
+        dist = self(state)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(dim=1, keepdim=True)
+        return action, log_prob
+
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    """Critic network for value estimation."""
+
+    def __init__(self, state_dim: int, action_dim: int):
         super(Critic, self).__init__()
         self.network = nn.Sequential(
-            nn.Linear(state_dim + action_dim + 1, 256),
+            nn.Linear(state_dim + action_dim, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, 128),
@@ -161,122 +129,219 @@ class Critic(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, state, action, next_steps):
-        x = torch.cat([state, action, next_steps], dim=1)
-        return self.network(x)
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.network(torch.cat([state, action], dim=1))
 
-def evaluate_policy(env, actor, num_episodes=10, video_folder="videos"):
-    total_rewards = []
+
+def evaluate_policy(actor: Actor, device: torch.device, env: gym.Env, save_path: str) -> float:
+    """Evaluate the current policy and record a video."""
+    env = RecordVideo(env, video_folder=save_path, episode_trigger=lambda episode_id: True)
     actor.eval()
-    os.makedirs(video_folder, exist_ok=True)
+    state, _ = env.reset(seed=42)
+    total_reward = 0.0
+    done = False
 
-    for episode_index in range(num_episodes):
-        frames = []
-        state, _ = env.reset()
-        terminated = False
-        truncated = False
-        episode_reward = 0
-        while not terminated and not truncated:
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            mean, std = actor(state_tensor)
-            dist = Normal(mean, std)
-            action = dist.mean.detach().cpu().numpy()[0]
-            state, reward, terminated, truncated, _ = env.step(action)
-            episode_reward += reward
+    with torch.no_grad():
+        while not done:
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+            action, _ = actor.sample_action(state_tensor)
+            action_np = action.cpu().numpy().flatten()
+            state, reward, terminated, truncated, _ = env.step(action_np)
+            total_reward += reward
+            done = terminated or truncated
 
-            frames.append(env.render())
+    env.close()
+    return total_reward
 
-        total_rewards.append(episode_reward)
 
-        save_video(
-            frames=frames,
-            video_folder=video_folder,
-            fps=env.metadata.get("render_fps", 30),
-            step_starting_index=0,
-            episode_index=episode_index,
+def load_latest_models(save_path: str, actor: Actor, critic: Critic, device: torch.device) -> None:
+    """Load the latest saved models from the specified path."""
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+        print(f"Created save directory at {save_path}")
+        return
+
+    folders = [
+        f for f in os.listdir(save_path)
+        if os.path.isdir(os.path.join(save_path, f)) and "_" in f
+    ]
+    if not folders:
+        print("No saved models found. Starting from scratch.")
+        return
+
+    try:
+        latest_folder = max(
+            folders,
+            key=lambda f: datetime.strptime(f.split('_')[-1], "%d%m%y")
         )
-    
-    avg_reward = np.mean(total_rewards)
-    return avg_reward
+        actor_path = os.path.join(save_path, latest_folder, "actor.pth")
+        critic_path = os.path.join(save_path, latest_folder, "critic.pth")
 
-def actor_critic_training(dataset, step_model, epochs=20, lr=1e-4, gamma=0.99, batch_size=256, env_name="D4RL/pen/expert-v2"):
-    observations = torch.tensor(dataset['observations'], dtype=torch.float32)
-    actions = torch.tensor(dataset['actions'], dtype=torch.float32)
-    rewards = torch.tensor(dataset['rewards'], dtype=torch.float32).unsqueeze(-1)
-    steps = torch.tensor(dataset['steps'], dtype=torch.float32).unsqueeze(-1)
-    next_observations = torch.tensor(dataset['next_observations'], dtype=torch.float32)
-    next_actions = torch.tensor(dataset['next_actions'], dtype=torch.float32)
-    next_steps = torch.tensor(dataset['next_steps'], dtype=torch.float32).unsqueeze(-1)
+        if os.path.exists(actor_path):
+            actor.load_state_dict(torch.load(actor_path, map_location=device))
+            print(f"Loaded actor model from {actor_path}")
 
-    full_dataset = TensorDataset(observations, actions, rewards, steps, next_observations, next_actions, next_steps)
-    train_size = int(len(full_dataset) * 0.8)
-    test_size = len(full_dataset) - train_size
-    train_dataset, _ = random_split(full_dataset, [train_size, test_size])
-    data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        if os.path.exists(critic_path):
+            critic.load_state_dict(torch.load(critic_path, map_location=device))
+            print(f"Loaded critic model from {critic_path}")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        print("Starting from scratch.")
 
-    state_dim = observations.shape[1]
-    action_dim = actions.shape[1]
 
-    actor = Actor(state_dim, action_dim)
-    critic = Critic(state_dim, action_dim)
+def train_actor_critic(
+    minari_dataset,
+    dataset: dict,
+    epochs: int,
+    lr: float,
+    gamma: float,
+    batch_size: int,
+    save_path: str,
+    device: torch.device
+) -> None:
+    """Train the Actor-Critic models using the provided dataset."""
+    state_dim = dataset['observations'].shape[1]
+    action_dim = dataset['actions'].shape[1]
+
+    actor = Actor(state_dim, action_dim).to(device)
+    critic = Critic(state_dim, action_dim).to(device)
+
+    load_latest_models(save_path, actor, critic, device)
 
     actor_optimizer = optim.Adam(actor.parameters(), lr=lr)
     critic_optimizer = optim.Adam(critic.parameters(), lr=lr)
-    mse_loss = nn.MSELoss()
-    env = minari.load_dataset(env_name).recover_environment(render_mode="rgb_array")
+    loss_fn = nn.MSELoss()
 
-    save_path = "c:/users/armin/step_aware/"
-    os.makedirs(save_path, exist_ok=True)
-    log_file = os.path.join(save_path, "actor_critic_log.txt")
+    observations = torch.tensor(dataset['observations'], dtype=torch.float32)
+    actions = torch.tensor(dataset['actions'], dtype=torch.float32)
+    rewards = torch.tensor(dataset['rewards'], dtype=torch.float32).unsqueeze(-1)
+    next_observations = torch.tensor(dataset['next_observations'], dtype=torch.float32)
+    dones = torch.tensor(dataset['dones'], dtype=torch.float32).unsqueeze(-1)
 
-    for epoch in range(epochs):
+    dataset_tensor = TensorDataset(observations, actions, rewards, next_observations, dones)
+    train_loader = DataLoader(
+        dataset_tensor, batch_size=batch_size, shuffle=True, drop_last=True
+    )
+
+    log_file = os.path.join(save_path, "training_log.txt")
+    with open(log_file, "a") as f:
+        f.write("Starting training...\n")
+
+    for epoch in range(1, epochs + 1):
         actor.train()
         critic.train()
-        epoch_actor_loss, epoch_critic_loss = 0, 0
-        for batch_states, batch_actions, batch_rewards, batch_steps, batch_next_states, batch_next_actions, batch_next_steps in data_loader:
-            step_predicted = step_model(batch_states)
-            predicted_values = critic(batch_states, batch_actions, step_predicted)
+
+        epoch_actor_loss = 0.0
+        epoch_critic_loss = 0.0
+
+        for batch in train_loader:
+            states, actions_batch, rewards_batch, next_states, dones_batch = [x.to(device) for x in batch]
+
+            # Critic Update
             with torch.no_grad():
-                next_step_predicted = step_model(batch_next_states)
-                next_values = critic(batch_next_states, batch_next_actions, batch_next_steps)
+                next_actions, _ = actor.sample_action(next_states)
+                prev_actions, _ = actor.sample_action(states)
+                target_q = rewards_batch + gamma * critic(next_states, next_actions) * (1 - dones_batch)
 
-            target_values = batch_rewards + gamma * next_values
-            advantages = target_values - predicted_values.detach()
+            current_q = critic(states, actions_batch)
+            critic_loss = loss_fn(current_q, target_q)
 
-            critic_loss = mse_loss(predicted_values, target_values)
+            # Additional penalty for critic loss
+            prev_q = critic(states, prev_actions)
+            next_q = critic(next_states, next_actions)
+
+            if (torch.abs(prev_q - current_q) > 0.1).any() and (torch.abs(next_q - current_q) > 0.1).any():
+                penalty = loss_fn(prev_q, current_q) + loss_fn(next_q, current_q)
+                critic_loss += penalty
+
             critic_optimizer.zero_grad()
             critic_loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
             critic_optimizer.step()
 
-            mean, std = actor(batch_states)
-            dist = Normal(mean, std)
-            action_sample = dist.rsample()
-            log_probs = dist.log_prob(action_sample).sum(dim=1, keepdim=True)
-            entropy = dist.entropy().sum(dim=1, keepdim=True)
-            actor_loss = -(log_probs * advantages + 0.01 * entropy).mean()
+            epoch_critic_loss += critic_loss.item()
+
+            # Actor Update
+            actions_new, _ = actor.sample_action(states)
+            actor_loss = -critic(states, actions_new).mean()
 
             actor_optimizer.zero_grad()
             actor_loss.backward()
+            nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
             actor_optimizer.step()
 
             epoch_actor_loss += actor_loss.item()
-            epoch_critic_loss += critic_loss.item()
 
-        avg_reward = evaluate_policy(env, actor)
-        print(f"Epoch {epoch+1}/{epochs}, Actor Loss: {epoch_actor_loss/len(data_loader):.4f}, "
-              f"Critic Loss: {epoch_critic_loss/len(data_loader):.4f}, Avg Reward: {avg_reward:.2f}")
-        
-        with open(log_file, "a") as log:
-            log.write(f"Epoch {epoch+1}, Actor Loss: {epoch_actor_loss/len(data_loader):.4f}, "
-                      f"Critic Loss: {epoch_critic_loss/len(data_loader):.4f}, Avg Reward: {avg_reward:.2f}\n")
-        
-        torch.save(actor.state_dict(), os.path.join(save_path, f"actor.pth"))
-        torch.save(critic.state_dict(), os.path.join(save_path, f"critic.pth"))
+        avg_actor_loss = epoch_actor_loss / len(train_loader)
+        avg_critic_loss = epoch_critic_loss / len(train_loader)
+
+        timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
+        epoch_save_folder = os.path.join(save_path, f"{timestamp}_epoch_{epoch}")
+        os.makedirs(epoch_save_folder, exist_ok=True)
+
+        env = minari_dataset.recover_environment(render_mode='rgb_array')
+        eval_reward = evaluate_policy(actor, device, env, epoch_save_folder)
+        env.close()
+
+        with open(log_file, "a") as f:
+            f.write(
+                f"Epoch {epoch}/{epochs}, "
+                f"Actor Loss: {avg_actor_loss:.4f}, "
+                f"Critic Loss: {avg_critic_loss:.4f}, "
+                f"Eval Reward: {eval_reward:.4f}\n"
+            )
+
+        torch.save(actor.state_dict(), os.path.join(epoch_save_folder, "actor.pth"))
+        torch.save(critic.state_dict(), os.path.join(epoch_save_folder, "critic.pth"))
+
+        print(
+            f"Epoch {epoch}/{epochs} | "
+            f"Actor Loss: {avg_actor_loss:.4f} | "
+            f"Critic Loss: {avg_critic_loss:.4f} | "
+            f"Eval Reward: {eval_reward:.4f}"
+        )
+
+
+def get_save_path() -> str:
+    """Determine the save path based on the operating system."""
+    return SAVE_PATH_WINDOWS if os.name == "nt" else SAVE_PATH_UNIX
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Train Actor-Critic Models")
+    parser.add_argument("--env_name", type=str, default=DEFAULT_ENV_NAME,
+                        help="Environment ID for Minari dataset")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="Learning rate")
+    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="Discount factor")
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size")
+    parser.add_argument(
+        "--save_path", type=str, default=get_save_path(),
+        help="Path to save models and logs"
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
+
+    set_seed(args.seed)
+
+    minari_dataset, data = download_dataset(args.env_name)
+
+    train_actor_critic(
+        minari_dataset=minari_dataset,
+        dataset=data,
+        epochs=args.epochs,
+        lr=args.lr,
+        gamma=args.gamma,
+        batch_size=args.batch_size,
+        save_path=args.save_path,
+        device=DEVICE
+    )
 
 
 if __name__ == "__main__":
-    env_name = 'D4RL/door/expert-v2'
-    set_seed()
-    dataset = download(env_name)[1]
-    step_model = train_step_prediction_model(dataset, epochs=1)
-    actor_critic_training(dataset, step_model, env_name=env_name, epochs=100)
+    main()
