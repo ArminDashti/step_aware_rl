@@ -13,6 +13,11 @@ import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 import minari
 
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_SEED = 42
@@ -46,43 +51,109 @@ def preprocess_dataset(dataset) -> dict:
     keys = [
         'observations', 'actions', 'rewards', 'terminations', 'truncations',
         'next_observations', 'prev_observations', 'prev_actions',
-        'prev_rewards', 'prev_dones'
+        'prev_rewards', 'prev_dones', 'next_actions', 'step_numbers'
     ]
     data = {key: [] for key in keys}
 
-    for episode in dataset.iterate_episodes():
-        episode_length = len(episode.observations)
-        for i in range(min(100, episode_length)):
-            data['observations'].append(episode.observations[i])
-            data['actions'].append(episode.actions[i])
-            data['rewards'].append(episode.rewards[i])
-            data['terminations'].append(episode.terminations[i])
-            data['truncations'].append(episode.truncations[i])
-            data['next_observations'].append(
-                episode.observations[i + 1] if i + 1 < episode_length else np.zeros_like(episode.observations[i])
-            )
-            data['prev_observations'].append(
-                episode.observations[i - 1] if i > 0 else np.zeros_like(episode.observations[i])
-            )
-            data['prev_actions'].append(
-                episode.actions[i - 1] if i > 0 else np.zeros_like(episode.actions[i])
-            )
-            data['prev_rewards'].append(episode.rewards[i - 1] if i > 0 else 0.0)
-            data['prev_dones'].append(
-                1 if i > 0 and (episode.terminations[i - 1] or episode.truncations[i - 1]) else 0
-            )
+    for episode_idx, episode in enumerate(dataset.iterate_episodes()):
+        # Verify that all necessary attributes exist
+        required_attrs = ['observations', 'actions', 'rewards', 'terminations', 'truncations']
+        for attr in required_attrs:
+            if not hasattr(episode, attr):
+                raise AttributeError(f"Episode {episode_idx} is missing required attribute '{attr}'.")
 
+        obs = episode.observations
+        actions = episode.actions
+        rewards = episode.rewards
+        terminations = episode.terminations
+        truncations = episode.truncations
+
+        # Ensure all lists have the same length
+        lengths = [len(obs), len(actions), len(rewards), len(terminations), len(truncations)]
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                f"Episode {episode_idx} has inconsistent lengths: "
+                f"observations={len(obs)}, actions={len(actions)}, rewards={len(rewards)}, "
+                f"terminations={len(terminations)}, truncations={len(truncations)}"
+            )
+        
+        episode_length = len(obs)
+        logger.info(f"Processing Episode {episode_idx}: Length={episode_length}")
+
+        for i in range(episode_length):
+            # Append current step data
+            data['observations'].append(obs[i])
+            data['actions'].append(actions[i])
+            data['rewards'].append(rewards[i])
+            data['terminations'].append(terminations[i])
+            data['truncations'].append(truncations[i])
+
+            # Handle next_observations
+            if i + 1 < episode_length:
+                next_obs = obs[i + 1]
+            else:
+                next_obs = np.zeros_like(obs[i])
+            data['next_observations'].append(next_obs)
+
+            # Handle next_actions
+            if i + 1 < episode_length:
+                next_act = actions[i + 1]
+            else:
+                next_act = np.zeros_like(actions[i])
+            data['next_actions'].append(next_act)
+
+            # Handle prev_observations
+            if i > 0:
+                prev_obs = obs[i - 1]
+            else:
+                prev_obs = np.zeros_like(obs[i])
+            data['prev_observations'].append(prev_obs)
+
+            # Handle prev_actions
+            if i > 0:
+                prev_act = actions[i - 1]
+            else:
+                prev_act = np.zeros_like(actions[i])
+            data['prev_actions'].append(prev_act)
+
+            # Handle prev_rewards
+            if i > 0:
+                prev_rew = rewards[i - 1]
+            else:
+                prev_rew = 0.0
+            data['prev_rewards'].append(prev_rew)
+
+            # Handle prev_dones
+            if i > 0 and (terminations[i - 1] or truncations[i - 1]):
+                prev_done = 1
+            else:
+                prev_done = 0
+            data['prev_dones'].append(prev_done)
+
+            # Step number
+            data['step_numbers'].append(i + 1)  # Step number starting from 1
+
+    # Convert lists to numpy arrays
     data['rewards'] = normalize_rewards(np.array(data['rewards']))
     data['prev_rewards'] = normalize_rewards(np.array(data['prev_rewards']))
     data['dones'] = np.logical_or(data['terminations'], data['truncations']).astype(int)
 
-    return {key: np.array(value) for key, value in data.items()}
+    # Ensure all data arrays have consistent shapes
+    for key in keys:
+        data[key] = np.array(data[key])
+    data['dones'] = np.array(data['dones'])
+
+    logger.info("Preprocessing completed successfully.")
+    return data
 
 
 def download_dataset(dataset_id: str) -> tuple:
     """Download and preprocess the Minari dataset."""
+    logger.info(f"Loading dataset '{dataset_id}' from Minari...")
     dataset = minari.load_dataset(dataset_id, True)
-    return dataset, preprocess_dataset(dataset)
+    logger.info("Dataset loaded successfully.")
+    processed_data = preprocess_dataset(dataset)
+    return dataset, processed_data
 
 
 class Actor(nn.Module):
@@ -119,8 +190,13 @@ class Critic(nn.Module):
 
     def __init__(self, state_dim: int, action_dim: int):
         super(Critic, self).__init__()
+        self.reward_transform = nn.Sequential(
+            nn.Linear(1, 4),
+            nn.ReLU(),
+            nn.Softmax(dim=-1)
+        )
         self.network = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
+            nn.Linear(state_dim + action_dim + 4, 256),  # Include transformed reward
             nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, 128),
@@ -129,13 +205,31 @@ class Critic(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.network(torch.cat([state, action], dim=1))
+    def forward(self, state: torch.Tensor, action: torch.Tensor, reward: torch.Tensor) -> torch.Tensor:
+        reward_features = self.reward_transform(reward).max(dim=-1, keepdim=True)[0]
+        return self.network(torch.cat([state, action, reward_features], dim=1))
+
+
+class StepPredictor(nn.Module):
+    """Neural network to predict step number from state."""
+
+    def __init__(self, state_dim: int):
+        super(StepPredictor, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)  # Output step number as a scalar
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.network(state)
 
 
 def evaluate_policy(actor: Actor, device: torch.device, env: gym.Env, save_path: str) -> float:
     """Evaluate the current policy and record a video."""
-    seeds = [42, 43, 44, 45]  # Define 4 seeds
+    seeds = [42]  # Define desired seeds
     total_rewards = []
 
     for seed in seeds:
@@ -158,16 +252,15 @@ def evaluate_policy(actor: Actor, device: torch.device, env: gym.Env, save_path:
         env.close()
 
     average_reward = sum(total_rewards) / len(total_rewards)
-    print(f"Average Reward over 4 seeds: {average_reward}")
+    logger.info(f"Average Reward over {len(seeds)} seeds: {average_reward}")
     return average_reward
-
 
 
 def load_latest_models(save_path: str, actor: Actor, critic: Critic, device: torch.device) -> None:
     """Load the latest saved models from the specified path."""
     if not os.path.exists(save_path):
         os.makedirs(save_path)
-        print(f"Created save directory at {save_path}")
+        logger.info(f"Created save directory at {save_path}")
         return
 
     folders = [
@@ -175,7 +268,7 @@ def load_latest_models(save_path: str, actor: Actor, critic: Critic, device: tor
         if os.path.isdir(os.path.join(save_path, f)) and "_" in f
     ]
     if not folders:
-        print("No saved models found. Starting from scratch.")
+        logger.info("No saved models found. Starting from scratch.")
         return
 
     try:
@@ -188,14 +281,14 @@ def load_latest_models(save_path: str, actor: Actor, critic: Critic, device: tor
 
         if os.path.exists(actor_path):
             actor.load_state_dict(torch.load(actor_path, map_location=device))
-            print(f"Loaded actor model from {actor_path}")
+            logger.info(f"Loaded actor model from {actor_path}")
 
         if os.path.exists(critic_path):
             critic.load_state_dict(torch.load(critic_path, map_location=device))
-            print(f"Loaded critic model from {critic_path}")
+            logger.info(f"Loaded critic model from {critic_path}")
     except Exception as e:
-        print(f"Error loading models: {e}")
-        print("Starting from scratch.")
+        logger.error(f"Error loading models: {e}")
+        logger.info("Starting from scratch.")
 
 
 def train_actor_critic(
@@ -226,8 +319,15 @@ def train_actor_critic(
     rewards = torch.tensor(dataset['rewards'], dtype=torch.float32).unsqueeze(-1)
     next_observations = torch.tensor(dataset['next_observations'], dtype=torch.float32)
     dones = torch.tensor(dataset['dones'], dtype=torch.float32).unsqueeze(-1)
+    next_actions = torch.tensor(dataset['next_actions'], dtype=torch.float32)
+    prev_observations = torch.tensor(dataset['prev_observations'], dtype=torch.float32)
+    prev_actions = torch.tensor(dataset['prev_actions'], dtype=torch.float32)
+    step_numbers = torch.tensor(dataset['step_numbers'], dtype=torch.float32).unsqueeze(-1)
 
-    dataset_tensor = TensorDataset(observations, actions, rewards, next_observations, dones)
+    dataset_tensor = TensorDataset(
+        observations, actions, rewards, next_observations,
+        dones, prev_observations, prev_actions, next_actions, step_numbers
+    )
     train_loader = DataLoader(
         dataset_tensor, batch_size=batch_size, shuffle=True, drop_last=True
     )
@@ -236,32 +336,31 @@ def train_actor_critic(
     with open(log_file, "a") as f:
         f.write("Starting training...\n")
 
+    alpha = 0.001
+    step = 0.001
+
     for epoch in range(1, epochs + 1):
         actor.train()
         critic.train()
 
         epoch_actor_loss = 0.0
         epoch_critic_loss = 0.0
+        alpha += step  # Unused variable, consider removing if not needed
 
         for batch in train_loader:
-            states, actions_batch, rewards_batch, next_states, dones_batch = [x.to(device) for x in batch]
+            (
+                states, actions_batch, rewards_batch, next_states,
+                dones_batch, prev_states, prev_actions_batch,
+                true_next_actions, step_numbers_batch
+            ) = [x.to(device) for x in batch]
 
             # Critic Update
             with torch.no_grad():
-                next_actions, _ = actor.sample_action(next_states)
-                prev_actions, _ = actor.sample_action(states)
-                target_q = rewards_batch + gamma * critic(next_states, next_actions) * (1 - dones_batch)
+                next_actions_pred, _ = actor.sample_action(next_states)
+                target_q = rewards_batch + gamma * critic(next_states, next_actions_pred, rewards_batch) * (1 - dones_batch)
 
-            current_q = critic(states, actions_batch)
+            current_q = critic(states, actions_batch, rewards_batch)
             critic_loss = loss_fn(current_q, target_q)
-
-            # Additional penalty for critic loss
-            prev_q = critic(states, prev_actions)
-            next_q = critic(next_states, next_actions)
-
-            if (torch.abs(prev_q - current_q) > 0.1).any() and (torch.abs(next_q - current_q) > 0.1).any():
-                penalty = loss_fn(prev_q, current_q) + loss_fn(next_q, current_q)
-                critic_loss += penalty
 
             critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -272,7 +371,7 @@ def train_actor_critic(
 
             # Actor Update
             actions_new, _ = actor.sample_action(states)
-            actor_loss = -critic(states, actions_new).mean()
+            actor_loss = -critic(states, actions_new, rewards_batch).mean()
 
             actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -303,7 +402,7 @@ def train_actor_critic(
         torch.save(actor.state_dict(), os.path.join(epoch_save_folder, "actor.pth"))
         torch.save(critic.state_dict(), os.path.join(epoch_save_folder, "critic.pth"))
 
-        print(
+        logger.info(
             f"Epoch {epoch}/{epochs} | "
             f"Actor Loss: {avg_actor_loss:.4f} | "
             f"Critic Loss: {avg_critic_loss:.4f} | "
