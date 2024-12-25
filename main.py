@@ -135,23 +135,32 @@ class Critic(nn.Module):
 
 def evaluate_policy(actor: Actor, device: torch.device, env: gym.Env, save_path: str) -> float:
     """Evaluate the current policy and record a video."""
-    env = RecordVideo(env, video_folder=save_path, episode_trigger=lambda episode_id: True)
-    actor.eval()
-    state, _ = env.reset(seed=42)
-    total_reward = 0.0
-    done = False
+    seeds = [42, 43, 44, 45]  # Define 4 seeds
+    total_rewards = []
 
-    with torch.no_grad():
-        while not done:
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-            action, _ = actor.sample_action(state_tensor)
-            action_np = action.cpu().numpy().flatten()
-            state, reward, terminated, truncated, _ = env.step(action_np)
-            total_reward += reward
-            done = terminated or truncated
+    for seed in seeds:
+        env = RecordVideo(env, video_folder=save_path, episode_trigger=lambda episode_id: True)
+        actor.eval()
+        state, _ = env.reset(seed=seed)
+        total_reward = 0.0
+        done = False
 
-    env.close()
-    return total_reward
+        with torch.no_grad():
+            while not done:
+                state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+                action, _ = actor.sample_action(state_tensor)
+                action_np = action.cpu().numpy().flatten()
+                state, reward, terminated, truncated, _ = env.step(action_np)
+                total_reward += reward
+                done = terminated or truncated
+
+        total_rewards.append(total_reward)
+        env.close()
+
+    average_reward = sum(total_rewards) / len(total_rewards)
+    print(f"Average Reward over 4 seeds: {average_reward}")
+    return average_reward
+
 
 
 def load_latest_models(save_path: str, actor: Actor, critic: Critic, device: torch.device) -> None:
